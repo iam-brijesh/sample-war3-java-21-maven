@@ -253,5 +253,4 @@ jobs:
             --timeout=5m
 
           echo "MS-3 deployment completed successfully."
-```
 
