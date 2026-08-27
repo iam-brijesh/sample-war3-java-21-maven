@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-
   workflow_dispatch:
 
 permissions:
@@ -45,15 +44,76 @@ jobs:
         run: |
           mvn clean package
 
+      # ========================================================
+      # OIDC DEBUG
+      # ========================================================
+      - name: Debug GitHub OIDC claims
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+        run: |
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Ref: $GITHUB_REF"
+          echo "Branch: $GITHUB_REF_NAME"
+
+          RESPONSE=$(curl -sSf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+
+          TOKEN=$(echo "$RESPONSE" | python3 -c \
+            'import sys,json; print(json.load(sys.stdin)["value"])')
+
+          PAYLOAD=$(echo "$TOKEN" | cut -d '.' -f2)
+
+          python3 - "$PAYLOAD" <<'PY'
+          import sys
+          import json
+          import base64
+
+          payload = sys.argv[1]
+          payload += "=" * (-len(payload) % 4)
+
+          claims = json.loads(
+              base64.urlsafe_b64decode(payload).decode()
+          )
+
+          print("========================================")
+          print("GitHub OIDC claims")
+          print("========================================")
+          print("iss =", claims.get("iss"))
+          print("aud =", claims.get("aud"))
+          print("sub =", claims.get("sub"))
+          print("repository =", claims.get("repository"))
+          print("ref =", claims.get("ref"))
+          print("repository_owner =", claims.get("repository_owner"))
+          print("========================================")
+          PY
+
+      # ========================================================
+      # AWS OIDC AUTHENTICATION
+      # ========================================================
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::453168420398:role/GitHubActionsRole
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+      # ========================================================
+      # ECR
+      # ========================================================
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Verify ECR repository
+        run: |
+          aws ecr describe-repositories \
+            --repository-names "$ECR_REPOSITORY" \
+            --region "$AWS_REGION"
 
       - name: Set image tag
         id: image
@@ -67,7 +127,7 @@ jobs:
           IMAGE_TAG: ${{ steps.image.outputs.image_tag }}
         run: |
           docker build \
-            -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
             .
 
       - name: Push Docker image
@@ -76,7 +136,7 @@ jobs:
           IMAGE_TAG: ${{ steps.image.outputs.image_tag }}
         run: |
           docker push \
-            $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+            "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
       - name: Show image
         env:
@@ -88,7 +148,7 @@ jobs:
 
 
   # ============================================================
-  # 2. DEPLOY TO EKS DEV NAMESPACE
+  # 2. DEPLOY TO EKS DEV
   # ============================================================
   deploy:
     name: Deploy MS-3 to DEV
@@ -99,12 +159,25 @@ jobs:
 
     steps:
 
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ========================================================
+      # AWS OIDC AUTHENTICATION
+      # ========================================================
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::453168420398:role/GitHubActionsRole
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+      # ========================================================
+      # KUBECTL
+      # ========================================================
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
         with:
@@ -113,78 +186,72 @@ jobs:
       - name: Update kubeconfig
         run: |
           aws eks update-kubeconfig \
-            --region $AWS_REGION \
-            --name $EKS_CLUSTER_NAME
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
 
       - name: Verify EKS cluster
         run: |
           kubectl cluster-info
           kubectl get nodes
 
+      # ========================================================
+      # NAMESPACE
+      # ========================================================
       - name: Create dev namespace
         run: |
-          kubectl create namespace $NAMESPACE \
+          kubectl create namespace "$NAMESPACE" \
             --dry-run=client \
             -o yaml | kubectl apply -f -
 
+      # ========================================================
+      # ECR REGISTRY
+      # ========================================================
       - name: Get ECR registry
         id: ecr
         run: |
-          REGISTRY=$(aws sts get-caller-identity \
+          ACCOUNT_ID=$(aws sts get-caller-identity \
             --query Account \
-            --output text).dkr.ecr.${AWS_REGION}.amazonaws.com
+            --output text)
 
-          echo "registry=$REGISTRY" >> "$GITHUB_OUTPUT"
+          echo "registry=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" \
+            >> "$GITHUB_OUTPUT"
 
-      - name: Deploy MS-3
+      # ========================================================
+      # HELM DEPLOYMENT
+      # ========================================================
+      - name: Deploy MS-3 with Helm
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
         run: |
-          kubectl -n $NAMESPACE create deployment ms-3 \
-            --image=$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-            --dry-run=client \
-            -o yaml | kubectl apply -f -
+          helm upgrade --install ms3 helm/ms3 \
+            --namespace "$NAMESPACE" \
+            --create-namespace \
+            -f helm/ms3/values.yaml \
+            -f helm/ms3/values-dev.yaml \
+            --set image.repository="$REGISTRY/$ECR_REPOSITORY" \
+            --set image.tag="$IMAGE_TAG" \
+            --wait \
+            --timeout 10m
 
-      - name: Scale MS-3
+      # ========================================================
+      # VERIFY DEPLOYMENT
+      # ========================================================
+      - name: Verify deployment
         run: |
-          kubectl -n $NAMESPACE scale deployment ms-3 --replicas=2
+          kubectl get deployment -n "$NAMESPACE"
+          kubectl get pods -n "$NAMESPACE" \
+            -l app.kubernetes.io/name=ms3
+          kubectl get service -n "$NAMESPACE"
+          kubectl get ingress -n "$NAMESPACE"
 
-      - name: Create MS-3 service
+      - name: Deployment status
         run: |
-          kubectl -n $NAMESPACE expose deployment ms-3 \
-            --name=ms-3 \
-            --port=8080 \
-            --target-port=8080 \
-            --type=ClusterIP \
-            --dry-run=client \
-            -o yaml | kubectl apply -f -
+          kubectl rollout status \
+            deployment/ms3-ms3 \
+            -n "$NAMESPACE" \
+            --timeout=5m
 
-      - name: Wait for deployment
-        run: |
-          kubectl -n $NAMESPACE rollout status \
-            deployment/ms-3 \
-            --timeout=300s
+          echo "MS-3 deployment completed successfully."
+```
 
-      - name: Verify MS-3
-        run: |
-          echo "======================================"
-          echo "MS-3 Deployment"
-          echo "======================================"
-
-          kubectl -n $NAMESPACE get deployment ms-3
-
-          echo ""
-          echo "======================================"
-          echo "MS-3 Pods"
-          echo "======================================"
-
-          kubectl -n $NAMESPACE get pods \
-            -l app=ms-3
-
-          echo ""
-          echo "======================================"
-          echo "MS-3 Service"
-          echo "======================================"
-
-          kubectl -n $NAMESPACE get service ms-3

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ms3
+description: Helm chart for MS3 Java WAR application
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
